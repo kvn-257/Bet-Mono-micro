@@ -13,7 +13,7 @@ def assign_weights(G, mean=0.5, sigma=1.0):
     return G
 
 # ----------------------------
-# Enforce DAG (critical)
+# Enforce DAG 
 # ----------------------------
 def enforce_dag(G):
     DG = nx.DiGraph()
