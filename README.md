@@ -9,7 +9,7 @@ This project is structured into four main phases. Currently, **Phase 1** is impl
 ### Phase 1: Static Analysis Ingestion (Implemented)
 - Parses output from `java-callgraph` and Jarviz dependency exports.
 - Constructs a unified edge list and dependency graph representing the monolithic architecture's structure.
-- Extracts the properties of real world graphs like density, direct acclic graph property etc. from this and generate synthetic graphs for benchmarking, for now we have 500 synthetic graphs.
+- Extracts the properties of real world softwaregraphs like density, directed acyclic graph property etc. from this and generate synthetic graphs for benchmarking, for now we have 500 synthetic graphs.
 
 ### Phase 2: Edge Betweenness Centrality Ranking (In progress)
 - Utilizes Graph Neural Networks (GNNs) to estimate the edge betweenness centrality ranking on the dependency graphs generated in Phase 1.
