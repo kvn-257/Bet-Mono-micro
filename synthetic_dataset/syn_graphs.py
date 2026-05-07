@@ -2,6 +2,9 @@ import networkx as nx
 import numpy as np
 import random
 
+random.seed(42)
+np.random.seed(42)
+
 
 
 # ----------------------------

@@ -36,7 +36,7 @@ class EdgeBetweennessGNN(nn.Module):
 
         # Edge Regressor
         self.regressor = nn.Sequential(
-            nn.Linear(hidden_channels * 2, 64),
+            nn.Linear(hidden_channels * 2 + 1, 64),
             nn.BatchNorm1d(64),
             nn.Dropout(0.2),
             nn.ReLU(),
@@ -47,7 +47,7 @@ class EdgeBetweennessGNN(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def forward(self, x, edge_index, n_id=None):
+    def forward(self, x, edge_index, edge_weight, n_id=None):
         # 1. Compute node embeddings using GraphSAGE
         # If learnable_features is enabled, ignore static x and use embeddings
         if self.learnable_features and n_id is not None:
@@ -58,8 +58,9 @@ class EdgeBetweennessGNN(nn.Module):
             x = F.relu(x)
 
         # 2. Create edge embeddings by concatenating source and target node embeddings
+        # along with the edge weight
         src, dst = edge_index
-        edge_embeds = torch.cat([x[src], x[dst]], dim=1)
+        edge_embeds = torch.cat([x[src], x[dst], edge_weight], dim=1)
 
         # 3. Predict edge betweenness centrality
         out = self.regressor(edge_embeds)
@@ -157,10 +158,19 @@ def graph_to_pyg_data(G: nx.DiGraph) -> Data:
 
     edges = []
     labels = []
+    weights = []
     
     for u, v in G.edges():
         edges.append([node_to_idx[u], node_to_idx[v]])
         labels.append(edge_bwc.get((u, v), 0.0))
+        weights.append([G[u][v].get('weight', 1.0)])
+
+    # normalize edge weights to [0, 1] to prevent overpowering node embeddings
+    if len(weights) > 0:
+        scaler = MinMaxScaler()
+        weights_scaled = scaler.fit_transform(weights)
+    else:
+        weights_scaled = weights
 
     # edge_index shape [2, num_edges]
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
@@ -168,27 +178,25 @@ def graph_to_pyg_data(G: nx.DiGraph) -> Data:
     # targets shape [num_edges]
     y = torch.tensor(labels, dtype=torch.float32)
 
+    # edge weights shape [num_edges, 1]
+    edge_weight = torch.tensor(weights_scaled, dtype=torch.float32)
+
     # input features
     x = extract_node_features(G)
     
     # assign local node ids (will be offset during batching or used directly)
     n_id = torch.arange(len(nodes), dtype=torch.long)
 
-    data = Data(x=x, edge_index=edge_index, y=y, n_id=n_id)
+    data = Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight, n_id=n_id)
     
     # Store original edge tuples for reference mapping later in Phase 3/4
     data.edge_tuples = list(G.edges())
     return data
 
 
-def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnable_features=False):
-    """
-    Trains the EdgeBetweennessGNN on a list of graphs.
-    """
+def prepare_dataset(graphs: list[nx.DiGraph], learnable_features=False):
     print(f"Preparing dataset from {len(graphs)} graphs...")
     dataset = []
-    
-    # We assign global node IDs so embeddings aren't shared between different nodes in different graphs
     global_node_count = 0
     for G in graphs:
         data = graph_to_pyg_data(G)
@@ -196,7 +204,13 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
             data.n_id = data.n_id + global_node_count
             global_node_count += data.x.size(0)
         dataset.append(data)
-    
+    return dataset, global_node_count
+
+
+def train_edge_bwc_model(dataset, global_node_count, epochs=100, lr=0.01, learnable_features=False, hidden_channels=64, num_layers=3):
+    """
+    Trains the EdgeBetweennessGNN on a list of graphs.
+    """
     # Split into train/test
     train_data, test_data = train_test_split(dataset, test_size=0.2, random_state=42)
     
@@ -205,14 +219,17 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
     
     model = EdgeBetweennessGNN(
         in_channels=in_channels, 
-        hidden_channels=64, 
-        num_layers=3, 
+        hidden_channels=hidden_channels, 
+        num_layers=num_layers, 
         learnable_features=learnable_features,
         max_nodes=global_node_count if learnable_features else 10000
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     print(f"Starting training for {epochs} epochs (Learnable Features: {learnable_features})...")
+    
+    best_val_tau = -1.0
+    best_metrics = {}
     
     for epoch in range(epochs):
         model.train()
@@ -221,7 +238,7 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
         for data in train_data:
             optimizer.zero_grad()
             n_id = data.n_id if learnable_features else None
-            out = model(data.x, data.edge_index, n_id)
+            out = model(data.x, data.edge_index, data.edge_weight, n_id)
             # Use Pairwise Margin Loss instead of MSE
             loss = margin_pair_loss(out, data.y, sample_size=5, margin=0.1)
             loss.backward()
@@ -230,7 +247,7 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
             
         avg_train_loss = total_loss / len(train_data)
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == epochs:
             model.eval()
             total_val_loss = 0
             total_tau = 0
@@ -242,7 +259,7 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
             with torch.no_grad():
                 for data in test_data:
                     n_id = data.n_id if learnable_features else None
-                    out = model(data.x, data.edge_index, n_id)
+                    out = model(data.x, data.edge_index, data.edge_weight, n_id)
                     val_loss = margin_pair_loss(out, data.y, sample_size=5, margin=0.1)
                     total_val_loss += val_loss.item()
                     
@@ -259,10 +276,21 @@ def train_edge_bwc_model(graphs: list[nx.DiGraph], epochs=100, lr=0.01, learnabl
             avg_p30 = total_p30 / len(test_data)
             avg_p50 = total_p50 / len(test_data)
             
-            print(f"Epoch {epoch+1:03d} | Val Loss: {avg_val_loss:.5f} | Val Tau: {avg_tau:.4f} | P@10: {avg_p10:.4f} | P@20: {avg_p20:.4f} | P@30: {avg_p30:.4f} | P@50: {avg_p50:.4f}")
+            if avg_tau > best_val_tau:
+                best_val_tau = avg_tau
+                best_metrics = {
+                    "val_tau": avg_tau,
+                    "p@10": avg_p10,
+                    "p@20": avg_p20,
+                    "p@30": avg_p30,
+                    "p@50": avg_p50
+                }
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1:03d} | Val Loss: {avg_val_loss:.5f} | Val Tau: {avg_tau:.4f} | P@10: {avg_p10:.4f} | P@20: {avg_p20:.4f} | P@30: {avg_p30:.4f} | P@50: {avg_p50:.4f}")
 
     print("Training complete.")
-    return model
+    return model, best_metrics
 
 
 if __name__ == "__main__":
@@ -281,15 +309,59 @@ if __name__ == "__main__":
     sys.path.append(str(project_root))
     
     try:
+        import json
+        import itertools
         from synthetic_dataset.syn_graphs import generate_dataset
         print(f"Generating {args.num_graphs} synthetic graphs...")
         graphs = generate_dataset(num_graphs=args.num_graphs)
         
-        model = train_edge_bwc_model(graphs, epochs=args.epochs, lr=0.005, learnable_features=args.learnable_features)
+        dataset, global_node_count = prepare_dataset(graphs, args.learnable_features)
+
+        # Hyperparameter Tuning
+        hidden_channels_opts = [16, 32, 64, 128]
+        num_layers_opts = [2, 3, 4]
+        lr_opts = [0.001, 0.005, 0.01]
         
-        # Save model
-        torch.save(model.state_dict(), "edge_bwc_gnn.pth")
-        print("Model saved to edge_bwc_gnn.pth")
+        best_tau = -1.0
+        best_model_state = None
+        best_hparams = {}
+        
+        for hc, nl, lr in itertools.product(hidden_channels_opts, num_layers_opts, lr_opts):
+            print(f"\n--- Tuning Config: hidden_channels={hc}, num_layers={nl}, lr={lr} ---")
+            model, metrics = train_edge_bwc_model(
+                dataset, 
+                global_node_count,
+                epochs=args.epochs, 
+                lr=lr, 
+                learnable_features=args.learnable_features,
+                hidden_channels=hc,
+                num_layers=nl
+            )
+            
+            if metrics.get("val_tau", -1) > best_tau:
+                best_tau = metrics.get("val_tau", -1)
+                best_model_state = model.state_dict()
+                best_hparams = {
+                    "hidden_channels": hc,
+                    "num_layers": nl,
+                    "lr": lr,
+                    "val_tau": metrics.get("val_tau", 0),
+                    "p@10": metrics.get("p@10", 0),
+                    "p@20": metrics.get("p@20", 0),
+                    "p@30": metrics.get("p@30", 0),
+                    "p@50": metrics.get("p@50", 0)
+                }
+                
+        print(f"\nBest Hyperparameters found: {best_hparams}")
+        
+        # Save best model
+        torch.save(best_model_state, "best_edge_bwc_gnn.pth")
+        print("Best model saved to best_edge_bwc_gnn.pth")
+        
+        # Save best hyperparameters
+        with open("best_hparams.json", "w") as f:
+            json.dump(best_hparams, f, indent=4)
+        print("Best hyperparameters saved to best_hparams.json")
         
     except ImportError as e:
         print(f"Could not import module: {e}")
