@@ -15,7 +15,7 @@ This project is structured into four main phases. Currently, **Phase 1** is impl
 - Utilizes Graph Neural Networks (GNNs) to estimate the edge betweenness centrality ranking on the dependency graphs generated in Phase 1.
 - Identifies critical edges that act as structural bottlenecks in the monolith.
 - Edge weights (normalized per-graph) are passed directly into the MLP regressor alongside GraphSAGE node embeddings.
-- Trained with weighted Pairwise Margin Loss on 500 synthetic graphs (80/20 train/test split).
+- Trained with weighted Pairwise Margin Loss on 500 synthetic graphs (80/20 train/test split) and evaluated on standard real software system graphs.
 
 #### Best Model — Hyperparameters
 
