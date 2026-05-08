@@ -30,13 +30,9 @@ This project is structured into four main phases. Currently, **Phase 1** is impl
 
 #### Best Model — Synthetic Validation Results
 
-| Metric        | Score  |
-|--------------|--------|
-| Kendall Tau  | 0.6651 |
-| Precision@10 | 0.5000 |
-| Precision@20 | 0.5680 |
-| Precision@30 | 0.6027 |
-| Precision@50 | 0.6502 |
+| Metric       | Kendall Tau  |  Precision@10   | Precision@20   | Precision@30   | Precision@50   |
+|--------------|--------------|----------------|----------------|----------------|----------------|
+| Value        | 0.6651       | 0.5000         | 0.5680         | 0.6027         | 0.6502         |
 
 #### Best Model — Real-World Graph Evaluation
 
