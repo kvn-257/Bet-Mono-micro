@@ -38,11 +38,11 @@ class EdgeBetweennessGNN(nn.Module):
         self.regressor = nn.Sequential(
             nn.Linear(hidden_channels * 2 + 1, 64),
             nn.BatchNorm1d(64),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.BatchNorm1d(32),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
@@ -67,7 +67,7 @@ class EdgeBetweennessGNN(nn.Module):
         return out.squeeze()
 
 
-def margin_pair_loss(y_out, true_val, sample_size=5, margin=0.1):
+def margin_pair_loss(y_out, true_val, sample_size=10, margin=1):
     """
     Margin ranking loss to train the model to output relative rankings of edges 
     instead of absolute betweenness scores.
@@ -86,8 +86,18 @@ def margin_pair_loss(y_out, true_val, sample_size=5, margin=0.1):
     
     x1 = y_out[order_y_true[ind_1]]
     x2 = y_out[order_y_true[ind_2]]
+
+    true_w1 = true_val[order_y_true[ind_1]]
+    true_w2 = true_val[order_y_true[ind_2]]
     
-    loss = torch.clamp(-y * (x1 - x2) + margin, min=0).mean()
+    raw_weights = true_w1 + true_w2
+    
+    # Normalize so the average weight is 1.0
+    # This prevents the vanishing gradient problem you correctly identified
+    importance_weights = raw_weights / (raw_weights.mean() + 1e-8)
+    
+    base_loss = torch.clamp(-y * (x1 - x2) + margin, min=0)
+    loss = (base_loss * importance_weights).mean()
     return loss
 
 
@@ -224,7 +234,7 @@ def train_edge_bwc_model(dataset, global_node_count, epochs=100, lr=0.01, learna
         learnable_features=learnable_features,
         max_nodes=global_node_count if learnable_features else 10000
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     print(f"Starting training for {epochs} epochs (Learnable Features: {learnable_features})...")
     
@@ -296,73 +306,151 @@ def train_edge_bwc_model(dataset, global_node_count, epochs=100, lr=0.01, learna
 if __name__ == "__main__":
     import argparse
     import sys
+    import json
+    import itertools
+    import pickle
     from pathlib import Path
-    
+
     parser = argparse.ArgumentParser(description="Phase 2: Edge Betweenness Centrality Estimation")
     parser.add_argument("--learnable-features", action="store_true", help="Use randomly initialized learnable parameters as node features instead of static centralities")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--num-graphs", type=int, default=500, help="Number of synthetic graphs to generate for training/testing")
     args = parser.parse_args()
-    
+
     # Add project root to sys.path
     project_root = Path(__file__).resolve().parent.parent
-    sys.path.append(str(project_root))
-    
+    sys.path.insert(0, str(project_root))
+
+    # -----------------------------------------------------------------------
+    # Load pre-built real-world graphs (built by build_real_graphs.py)
+    # -----------------------------------------------------------------------
+    real_world_dir = project_root / "real_world_graphs"
+    real_world_data: list = []   # list of (repo_name, Data)
+
+    if real_world_dir.exists():
+        pickle_files = sorted(real_world_dir.glob("*.gpickle"))
+        if pickle_files:
+            print(f"\nLoading {len(pickle_files)} real-world graphs for evaluation...")
+            for pf in pickle_files:
+                try:
+                    with open(pf, "rb") as f:
+                        G_real = pickle.load(f)
+                    if G_real.number_of_edges() > 0:
+                        rw_data = graph_to_pyg_data(G_real)
+                        real_world_data.append((pf.stem, rw_data))
+                        print(f"  Loaded {pf.stem}: {G_real.number_of_nodes()} nodes, "
+                              f"{G_real.number_of_edges()} edges")
+                    else:
+                        print(f"  [SKIP] {pf.stem}: no edges after filtering")
+                except Exception as e:
+                    print(f"  [WARN] Could not load {pf.name}: {e}")
+        else:
+            print("\n[WARN] No .gpickle files found in real_world_graphs/. "
+                  "Run build_real_graphs.py first for real-world evaluation.")
+    else:
+        print("\n[WARN] real_world_graphs/ directory not found. "
+              "Run build_real_graphs.py first for real-world evaluation.")
+
+    def evaluate_on_real_graphs(model: nn.Module) -> dict:
+        """Run inference on every pre-loaded real-world graph and return per-repo metrics."""
+        model.eval()
+        results = {}
+        with torch.no_grad():
+            for repo_name, rw_data in real_world_data:
+                out = model(rw_data.x, rw_data.edge_index, rw_data.edge_weight, None)
+                tau = kendall_tau_metric(out, rw_data.y)
+                p10 = precision_at_k(out, rw_data.y, k=10)
+                p20 = precision_at_k(out, rw_data.y, k=20)
+                p30 = precision_at_k(out, rw_data.y, k=30)
+                p50 = precision_at_k(out, rw_data.y, k=50)
+                results[repo_name] = {
+                    "tau":  round(tau, 4),
+                    "p@10": round(p10, 4),
+                    "p@20": round(p20, 4),
+                    "p@30": round(p30, 4),
+                    "p@50": round(p50, 4),
+                }
+                print(f"    [{repo_name}] Tau: {tau:.4f} | P@10: {p10:.4f} | "
+                      f"P@20: {p20:.4f} | P@30: {p30:.4f} | P@50: {p50:.4f}")
+
+        # Macro-average across all repos
+        if results:
+            repo_vals = list(results.values())
+            results["avg"] = {
+                "tau":  round(sum(r["tau"]  for r in repo_vals) / len(repo_vals), 4),
+                "p@10": round(sum(r["p@10"] for r in repo_vals) / len(repo_vals), 4),
+                "p@20": round(sum(r["p@20"] for r in repo_vals) / len(repo_vals), 4),
+                "p@30": round(sum(r["p@30"] for r in repo_vals) / len(repo_vals), 4),
+                "p@50": round(sum(r["p@50"] for r in repo_vals) / len(repo_vals), 4),
+            }
+            avg = results["avg"]
+            print(f"    [AVG] Tau: {avg['tau']:.4f} | P@10: {avg['p@10']:.4f} | "
+                  f"P@20: {avg['p@20']:.4f} | P@30: {avg['p@30']:.4f} | P@50: {avg['p@50']:.4f}")
+        return results
+
     try:
-        import json
-        import itertools
         from synthetic_dataset.syn_graphs import generate_dataset
-        print(f"Generating {args.num_graphs} synthetic graphs...")
+        print(f"\nGenerating {args.num_graphs} synthetic graphs...")
         graphs = generate_dataset(num_graphs=args.num_graphs)
-        
+
         dataset, global_node_count = prepare_dataset(graphs, args.learnable_features)
 
         # Hyperparameter Tuning
-        hidden_channels_opts = [16, 32, 64, 128]
-        num_layers_opts = [2, 3, 4]
-        lr_opts = [0.001, 0.005, 0.01]
-        
-        best_tau = -1.0
+        hidden_channels_opts = [16, 32, 64]
+        num_layers_opts      = [2, 3, 4]
+        lr_opts              = [0.001, 0.005, 0.01]
+
+        best_tau         = -1.0
         best_model_state = None
-        best_hparams = {}
-        
+        best_hparams     = {}
+
         for hc, nl, lr in itertools.product(hidden_channels_opts, num_layers_opts, lr_opts):
             print(f"\n--- Tuning Config: hidden_channels={hc}, num_layers={nl}, lr={lr} ---")
             model, metrics = train_edge_bwc_model(
-                dataset, 
+                dataset,
                 global_node_count,
-                epochs=args.epochs, 
-                lr=lr, 
+                epochs=args.epochs,
+                lr=lr,
                 learnable_features=args.learnable_features,
                 hidden_channels=hc,
                 num_layers=nl
             )
-            
+
+            # Evaluate on real-world graphs after each run
+            rw_metrics = {}
+            if real_world_data:
+                print(f"  >> Real-world evaluation (hc={hc}, nl={nl}, lr={lr}):")
+                rw_metrics = evaluate_on_real_graphs(model)
+
             if metrics.get("val_tau", -1) > best_tau:
-                best_tau = metrics.get("val_tau", -1)
+                best_tau         = metrics.get("val_tau", -1)
                 best_model_state = model.state_dict()
                 best_hparams = {
-                    "hidden_channels": hc,
-                    "num_layers": nl,
-                    "lr": lr,
-                    "val_tau": metrics.get("val_tau", 0),
-                    "p@10": metrics.get("p@10", 0),
-                    "p@20": metrics.get("p@20", 0),
-                    "p@30": metrics.get("p@30", 0),
-                    "p@50": metrics.get("p@50", 0)
+                    "hidden_channels":      hc,
+                    "num_layers":           nl,
+                    "lr":                   lr,
+                    "synthetic_val_tau":    metrics.get("val_tau", 0),
+                    "synthetic_p@10":       metrics.get("p@10", 0),
+                    "synthetic_p@20":       metrics.get("p@20", 0),
+                    "synthetic_p@30":       metrics.get("p@30", 0),
+                    "synthetic_p@50":       metrics.get("p@50", 0),
+                    "real_world_avg":       rw_metrics.get("avg", {}),
+                    "real_world":           {k: v for k, v in rw_metrics.items() if k != "avg"},
                 }
-                
+
         print(f"\nBest Hyperparameters found: {best_hparams}")
-        
+
         # Save best model
         torch.save(best_model_state, "best_edge_bwc_gnn.pth")
         print("Best model saved to best_edge_bwc_gnn.pth")
-        
+
         # Save best hyperparameters
         with open("best_hparams.json", "w") as f:
             json.dump(best_hparams, f, indent=4)
         print("Best hyperparameters saved to best_hparams.json")
-        
+
     except ImportError as e:
         print(f"Could not import module: {e}")
         print("Make sure you are running from the project root or PYTHONPATH is set correctly.")
+
+
